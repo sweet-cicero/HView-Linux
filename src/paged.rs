@@ -174,7 +174,7 @@ The change time also identifies metadata updates and restored modification times
 These checks cannot exclude every concurrent writer on Linux.
 */
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct SourceStamp {
+pub(crate) struct SourceStamp {
     device: u64,
     inode: u64,
     len: u64,
@@ -193,7 +193,7 @@ impl SourceStamp {
     This conversion captures one metadata sample from the owned descriptor.
     Later reads compare a new sample with these exact fields.
     */
-    fn from_metadata(metadata: &Metadata) -> Self {
+    pub(crate) fn from_metadata(metadata: &Metadata) -> Self {
         Self {
             device: metadata.dev(),
             inode: metadata.ino(),
@@ -210,7 +210,7 @@ impl SourceStamp {
     A time change reports a general external source change.
     The caller must reopen the source before another read.
     */
-    fn validate(self, current: Self) -> io::Result<()> {
+    pub(crate) fn validate(self, current: Self) -> io::Result<()> {
         if current.device != self.device || current.inode != self.inode {
             return Err(io::Error::other(
                 "The source identity changed. Reopen the source.",
@@ -242,10 +242,16 @@ impl SourceStamp {
 /*
 OpenedSource returns one storage form from one opened descriptor.
 Small sources publish their complete bytes only after source validation.
+Buffered sources retain the read descriptor so Save can verify the accepted identity.
+The retained source stamp binds buffered Compare validation to the accepted bytes.
 Large sources keep the same descriptor for bounded reads.
 */
 pub(crate) enum OpenedSource {
-    Buffered(Vec<u8>),
+    Buffered {
+        data: Vec<u8>,
+        file: File,
+        stamp: SourceStamp,
+    },
     Paged(PagedFile),
 }
 
@@ -377,9 +383,9 @@ impl PagedFile {
     This conversion reads a selected small source from the descriptor used for classification.
     Bounded sequential reads preserve short-content Linux virtual regular files.
     The extra byte detects growth beyond the buffered limit without a file-sized allocation.
-    Source validation completes before the byte buffer becomes available.
+    Source validation completes before the byte buffer, read descriptor, and source stamp become available.
     */
-    fn into_buffered(mut self) -> io::Result<Vec<u8>> {
+    fn into_buffered(mut self) -> io::Result<OpenedSource> {
         let limit = usize::try_from(BUFFERED_FILE_LIMIT).unwrap();
         let expected = usize::try_from(self.stamp.len).unwrap_or(limit).min(limit);
         let mut bytes = Vec::new();
@@ -414,7 +420,11 @@ impl PagedFile {
         }
 
         self.validate()?;
-        Ok(bytes)
+        Ok(OpenedSource::Buffered {
+            data: bytes,
+            file: self.file,
+            stamp: self.stamp,
+        })
     }
 
     /*
@@ -1546,7 +1556,7 @@ impl PagedFile {
 
 /*
 This entry point opens one regular file and selects its storage from captured metadata.
-The buffered path consumes the same descriptor instead of reopening the pathname.
+The buffered path retains the descriptor with its accepted bytes for later Save identity checks.
 The paged path retains that descriptor for later visible-window reads.
 */
 pub(crate) fn open_source(path: &Path) -> io::Result<OpenedSource> {
@@ -1555,7 +1565,7 @@ pub(crate) fn open_source(path: &Path) -> io::Result<OpenedSource> {
         source.validate()?;
         Ok(OpenedSource::Paged(source))
     } else {
-        source.into_buffered().map(OpenedSource::Buffered)
+        source.into_buffered()
     }
 }
 
@@ -3224,7 +3234,7 @@ mod tests {
         let buffered_path = fixture.file("buffered.bin");
         sparse_file(&buffered_path, BUFFERED_FILE_LIMIT, &[(0, b"B")])?;
         match open_source(&buffered_path)? {
-            OpenedSource::Buffered(bytes) => {
+            OpenedSource::Buffered { data: bytes, .. } => {
                 assert_eq!(bytes.len() as u64, BUFFERED_FILE_LIMIT);
                 assert_eq!(bytes[0], b'B');
             }
@@ -3238,7 +3248,9 @@ mod tests {
                 assert_eq!(source.len(), BUFFERED_FILE_LIMIT + 1);
                 assert_eq!(&*source.read_window(0, 1)?.bytes, b"P");
             }
-            OpenedSource::Buffered(_) => panic!("A file above the cutoff must use paged storage."),
+            OpenedSource::Buffered { .. } => {
+                panic!("A file above the cutoff must use paged storage.")
+            }
         }
         Ok(())
     }
@@ -3254,7 +3266,7 @@ mod tests {
         assert!(metadata.is_file());
         assert_eq!(metadata.len(), 0);
         match open_source(path)? {
-            OpenedSource::Buffered(bytes) => assert!(!bytes.is_empty()),
+            OpenedSource::Buffered { data: bytes, .. } => assert!(!bytes.is_empty()),
             OpenedSource::Paged(_) => panic!("The zero-length source must use buffered storage."),
         }
         Ok(())
@@ -3269,7 +3281,7 @@ mod tests {
         let path = Path::new("/sys/kernel/uevent_seqnum");
         let reported_len = path.metadata()?.len();
         match open_source(path)? {
-            OpenedSource::Buffered(data) => {
+            OpenedSource::Buffered { data, .. } => {
                 assert!(!data.is_empty());
                 assert!((data.len() as u64) < reported_len);
                 assert_eq!(data.last(), Some(&b'\n'));
@@ -3294,7 +3306,7 @@ mod tests {
         sparse_file(&path, len, &[(0, b"OLD")])?;
         let source = match open_source(&path)? {
             OpenedSource::Paged(source) => source,
-            OpenedSource::Buffered(_) => panic!("The large source must use paged storage."),
+            OpenedSource::Buffered { .. } => panic!("The large source must use paged storage."),
         };
 
         fs::rename(&path, &old_path)?;
@@ -3310,7 +3322,7 @@ mod tests {
 
         let reopened = match open_source(&path)? {
             OpenedSource::Paged(source) => source,
-            OpenedSource::Buffered(_) => panic!("The replacement must use paged storage."),
+            OpenedSource::Buffered { .. } => panic!("The replacement must use paged storage."),
         };
         assert_eq!(&*reopened.read_window(0, 3)?.bytes, b"NEW");
         Ok(())

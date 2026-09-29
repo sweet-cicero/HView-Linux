@@ -1179,11 +1179,12 @@ fn initial_session_view(
     /*
     The common source selector classifies one opened descriptor before initialization.
     Buffered and paged files resolve startup offsets from their current logical bytes.
+    Inactive buffered records need no Save descriptor because this function retains only view metadata.
     */
     match crate::paged::open_source(path)
         .map_err(|error| format!("Cannot read {}: {error}", path.display()))?
     {
-        crate::paged::OpenedSource::Buffered(data) => {
+        crate::paged::OpenedSource::Buffered { data, .. } => {
             let initial_offset = session_offset(&data, startup_offset);
             let mut initial = config.new_view(data, startup_mode, initial_offset)?;
             initial.top = match startup_mode {

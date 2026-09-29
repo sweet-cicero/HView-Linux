@@ -13,6 +13,7 @@ const EM_ARM: u16 = 40;
 /*
 These ELF limits match the supported little-endian header forms and bound all metadata work.
 The entry limits protect allocation, and the byte limit protects paged program-table reads.
+The structure text limit also bounds escaped names across all retained browser rows.
 */
 const ELF_MAGIC: &[u8; 4] = b"\x7fELF";
 const ELF32_HEADER_SIZE: usize = 52;
@@ -24,6 +25,7 @@ const ELF64_SECTION_SIZE: usize = 64;
 const ELF_MAX_ENTRIES: usize = 100_000;
 const ELF_MAX_LOAD_SEGMENTS: usize = 256;
 const ELF_MAX_PROGRAM_BYTES: u64 = 8 * 1024 * 1024;
+const ELF_MAX_STRUCTURE_TEXT_BYTES: usize = 16 * 1024 * 1024;
 const ELF_RESERVED_INDEX_START: usize = 0xff00;
 
 /*
@@ -2174,11 +2176,12 @@ struct BrowserPe {
 }
 
 /*
-BrowserElfSection retains validated section data and its resolved escaped name.
+BrowserElfSection retains validated section data and its raw name range in the source.
 BrowserElf keeps complete program and section rows beside the smaller shared ELF map.
+Name ranges permit complete validation without escaped text allocation for discarded rows.
 */
 struct BrowserElfSection {
-    name: String,
+    name: std::ops::Range<usize>,
     name_offset: u32,
     header: usize,
     section_type: u32,
@@ -2364,7 +2367,7 @@ impl BrowserElfSection {
                 )
             };
         Ok(Self {
-            name: String::new(),
+            name: 0..0,
             name_offset,
             header: usize::try_from(header_offset)
                 .map_err(|_| "The ELF section-header offset is too large.")?,
@@ -2507,19 +2510,26 @@ impl BrowserElf {
             section.validate(data, header.bits, index)?;
             sections.push(section);
         }
-        let mut section_ranges: Vec<_> = sections
-            .iter()
-            .skip(1)
-            .filter(|section| section.section_type != 8 && section.size != 0)
-            .map(|section| (section.offset, section.offset + section.size))
-            .collect();
+        let mut section_ranges = Vec::new();
+        section_ranges
+            .try_reserve_exact(sections.len().saturating_sub(1))
+            .map_err(|_| "Cannot allocate the ELF section ranges.")?;
+        section_ranges.extend(
+            sections
+                .iter()
+                .skip(1)
+                .filter(|section| section.section_type != 8 && section.size != 0)
+                .map(|section| (section.offset, section.offset + section.size)),
+        );
         section_ranges.sort_unstable();
         if section_ranges.windows(2).any(|pair| pair[1].0 < pair[0].1) {
             return Err("Two ELF section file ranges overlap.".into());
         }
 
         /*
-        The name section validates the string table and resolves each bounded null-terminated name.
+        The name section validates every bounded null-terminated name and retains its source range.
+        Shared names do not allocate shared escaped text for every section.
+        Row creation later escapes only retained names within the aggregate text limit.
         The final map then rechecks PT_LOAD aliases before the browser exposes rows.
         */
         if header.section_names == 0 {
@@ -2532,6 +2542,7 @@ impl BrowserElf {
                 return Err("The ELF section-name table is invalid.".into());
             }
             let range = elf_range(data, names.offset, names.size, "section-name table")?;
+            let table_start = range.start;
             let table = &data[range];
             if table.first() != Some(&0) || table.last() != Some(&0) {
                 return Err(
@@ -2556,7 +2567,7 @@ impl BrowserElf {
                     }
                     return Err("An ELF section name is not null-terminated.".into());
                 };
-                section.name = escaped(&table[offset..offset + length]);
+                section.name = table_start + offset..table_start + offset + length;
             }
         }
         let mapping = Elf::from_parts(header, loads, data.len() as u64)?;
@@ -3332,43 +3343,111 @@ fn elf_flags(flags: u32) -> String {
 }
 
 /*
+This helper combines fixed row fields with one raw ELF name after the caller checks row capacity.
+The exact escaped size includes every retained row field in the aggregate text limit.
+An excessive row returns an error before the helper allocates or escapes the name.
+*/
+fn add_elf_row(
+    rows: &mut Vec<(usize, String)>,
+    text_bytes: &mut usize,
+    offset: usize,
+    prefix: &str,
+    name: &[u8],
+    suffix: &str,
+) -> Result<(), String> {
+    /*
+    The size section counts each escaped byte without creating text.
+    Checked addition rejects size overflow and aggregate text above 16 MiB.
+    */
+    let name_bytes: usize = name
+        .iter()
+        .map(|&byte| std::ascii::escape_default(byte).len())
+        .sum();
+    let row_bytes = prefix
+        .len()
+        .checked_add(name_bytes)
+        .and_then(|value| value.checked_add(suffix.len()))
+        .ok_or("The ELF structure text exceeds the limit of 16 MiB.")?;
+    let total_bytes = text_bytes
+        .checked_add(row_bytes)
+        .filter(|&value| value <= ELF_MAX_STRUCTURE_TEXT_BYTES)
+        .ok_or("The ELF structure text exceeds the limit of 16 MiB.")?;
+
+    /*
+    The output section reserves the accepted row and text with fallible allocation.
+    Escaping uses the existing browser byte rules without a separate name string.
+    The completed row updates the aggregate count for the next row.
+    */
+    rows.try_reserve(1)
+        .map_err(|_| "Cannot allocate the ELF structure rows.")?;
+    let mut text = String::new();
+    text.try_reserve_exact(row_bytes)
+        .map_err(|_| "Cannot allocate the ELF structure text.")?;
+    text.push_str(prefix);
+    for &byte in name {
+        for value in std::ascii::escape_default(byte) {
+            text.push(char::from(value));
+        }
+    }
+    text.push_str(suffix);
+    rows.push((offset, text));
+    *text_bytes = total_bytes;
+    Ok(())
+}
+
+/*
 This browser converts one fully validated ELF model into selectable header, entry, program, and section rows.
 Rows without source data use their table entry as the navigation location.
+The caller row limit stops formatting, and the aggregate text limit bounds all retained row strings.
 */
 fn elf_structures(data: &[u8], limit: usize) -> Result<Vec<(usize, String)>, String> {
     let elf = BrowserElf::parse(data)?;
-    let mut rows = Vec::with_capacity(limit.min(1_024));
+    let mut rows = Vec::new();
+    let mut text_bytes = 0;
 
     /*
     The first section adds the fixed header and an optional file-backed entry row.
     A Thumb entry row displays the original state bit from the ELF header.
+    Entry mapping remains checked when the caller retains no rows.
     */
-    add_row(
-        &mut rows,
-        limit,
-        0,
-        format!(
-            "ELF{} header | Type={} Machine={:#06X} Entry={:016X}",
-            elf.header.bits, elf.header.file_type, elf.header.machine, elf.header.entry
-        ),
-    );
-    if let Some(entry_file) = elf.mapping.entry_offset()? {
-        add_row(
+    if rows.len() < limit {
+        add_elf_row(
             &mut rows,
-            limit,
+            &mut text_bytes,
+            0,
+            &format!(
+                "ELF{} header | Type={} Machine={:#06X} Entry={:016X}",
+                elf.header.bits, elf.header.file_type, elf.header.machine, elf.header.entry
+            ),
+            b"",
+            "",
+        )?;
+    }
+    if let Some(entry_file) = elf.mapping.entry_offset()?
+        && rows.len() < limit
+    {
+        add_elf_row(
+            &mut rows,
+            &mut text_bytes,
             usize::try_from(entry_file).map_err(|_| "The ELF entry file offset is too large.")?,
-            format!(
+            &format!(
                 "Entry | File={entry_file:016X} VA={:016X}",
                 elf.header.entry
             ),
-        );
+            b"",
+            "",
+        )?;
     }
 
     /*
     The program section adds all declared entries, including unknown types and PT_NULL records.
     File-backed records navigate to their source bytes, while empty records navigate to their headers.
+    The parser has already validated entries beyond the caller row limit.
     */
     for (index, segment) in elf.segments.iter().enumerate() {
+        if rows.len() >= limit {
+            break;
+        }
         let file = if segment.segment_type == 0 || segment.file_size == 0 {
             "-".into()
         } else {
@@ -3384,12 +3463,12 @@ fn elf_structures(data: &[u8], limit: usize) -> Result<Vec<(usize, String)>, Str
         } else {
             format!("VA={:016X}", segment.address)
         };
-        add_row(
+        add_elf_row(
             &mut rows,
-            limit,
+            &mut text_bytes,
             usize::try_from(navigation)
                 .map_err(|_| "The ELF program-header navigation offset is too large.")?,
-            format!(
+            &format!(
                 "Program[{index}] {} | File={file} {address} FileSize={:016X} MemorySize={:016X} Flags={} Align={:X} HeaderFile={:016X}",
                 elf_segment_name(segment.segment_type),
                 segment.file_size,
@@ -3398,18 +3477,25 @@ fn elf_structures(data: &[u8], limit: usize) -> Result<Vec<(usize, String)>, Str
                 segment.align,
                 segment.header
             ),
-        );
+            b"",
+            "",
+        )?;
     }
 
     /*
     The section section omits section zero and gives NOBITS or empty sections header navigation.
-    The completed rows retain the caller limit after the parser validates all declared data.
+    Retained rows read validated raw name ranges and check escaped size before text allocation.
+    The parser has already validated names beyond the caller row limit.
     */
     for (index, section) in elf.sections.iter().enumerate().skip(1) {
-        let name = if section.name.is_empty() {
-            "<unnamed>"
+        if rows.len() >= limit {
+            break;
+        }
+        let name = &data[section.name.clone()];
+        let name = if name.is_empty() {
+            b"<unnamed>".as_slice()
         } else {
-            &section.name
+            name
         };
         let has_bytes = section.section_type != 8 && section.size != 0;
         let file = if has_bytes {
@@ -3427,22 +3513,25 @@ fn elf_structures(data: &[u8], limit: usize) -> Result<Vec<(usize, String)>, Str
         } else {
             format!("{:016X}", section.address)
         };
-        add_row(
+        add_elf_row(
             &mut rows,
-            limit,
+            &mut text_bytes,
             usize::try_from(navigation)
                 .map_err(|_| "The ELF section navigation offset is too large.")?,
-            format!(
-                "Section[{index}] {name} {} | File={file} VA={address} Size={:016X} Flags={:X} Align={:X} HeaderFile={:016X}",
+            &format!("Section[{index}] "),
+            name,
+            &format!(
+                " {} | File={file} VA={address} Size={:016X} Flags={:X} Align={:X} HeaderFile={:016X}",
                 elf_section_name(section.section_type),
                 section.size,
                 section.flags,
                 section.align,
                 section.header
             ),
-        );
+        )?;
     }
     debug_assert!(rows.len() <= limit);
+    debug_assert!(text_bytes <= ELF_MAX_STRUCTURE_TEXT_BYTES);
     debug_assert!(rows.iter().all(|(offset, _)| *offset < data.len()));
     Ok(rows)
 }
@@ -3901,6 +3990,75 @@ mod tests {
         }
         data[0x110..0x115].copy_from_slice(&[0xe8, 0x0b, 0, 0, 0]);
         data[0x120] = 0xc3;
+        data
+    }
+
+    /*
+    This fixture creates an ELF32 or ELF64 ET_REL file with one name shared by every nonzero section.
+    Section one owns the string table, and later NOBITS sections require no file data.
+    Large counts use the canonical extended count in section header zero.
+    */
+    fn elf_shared_name_fixture(bits: u32, count: usize, name: &[u8]) -> Vec<u8> {
+        assert!((2..=ELF_MAX_ENTRIES).contains(&count));
+        let header = elf_fixture(bits, if bits == 32 { 3 } else { 62 }, 1, false);
+        let (header_size, section_size) = if bits == 32 {
+            (ELF32_HEADER_SIZE, ELF32_SECTION_SIZE)
+        } else {
+            (ELF64_HEADER_SIZE, ELF64_SECTION_SIZE)
+        };
+        let names_file = header_size + count * section_size;
+        let names_size = name.len() + 2;
+        let mut data = vec![0; names_file + names_size];
+        data[..header_size].copy_from_slice(&header[..header_size]);
+        data[names_file + 1..names_file + 1 + name.len()].copy_from_slice(name);
+
+        /*
+        The header section replaces the ordinary fixture geometry with the complete synthetic section table.
+        The name-table index remains one for both normal and extended section counts.
+        */
+        let short_count = if count >= ELF_RESERVED_INDEX_START {
+            0
+        } else {
+            count as u16
+        };
+        if bits == 32 {
+            put(&mut data, 32, header_size as u32);
+            put_word(&mut data, 46, section_size as u16);
+            put_word(&mut data, 48, short_count);
+            put_word(&mut data, 50, 1);
+            if short_count == 0 {
+                put(&mut data, header_size + 20, count as u32);
+            }
+        } else {
+            put_qword(&mut data, 40, header_size as u64);
+            put_word(&mut data, 58, section_size as u16);
+            put_word(&mut data, 60, short_count);
+            put_word(&mut data, 62, 1);
+            if short_count == 0 {
+                put_qword(&mut data, header_size + 32, count as u64);
+            }
+        }
+
+        /*
+        The record section assigns the same raw name offset to every nonzero section.
+        Only the string-table section owns file bytes, so repeated names create no overlapping section ranges.
+        */
+        for index in 1..count {
+            let at = header_size + index * section_size;
+            put(&mut data, at, 1);
+            put(&mut data, at + 4, if index == 1 { 3 } else { 8 });
+            let offset = if index == 1 { names_file } else { 0 };
+            let size = if index == 1 { names_size } else { 1 };
+            if bits == 32 {
+                put(&mut data, at + 16, offset as u32);
+                put(&mut data, at + 20, size as u32);
+                put(&mut data, at + 32, 1);
+            } else {
+                put_qword(&mut data, at + 24, offset as u64);
+                put_qword(&mut data, at + 32, size as u64);
+                put_qword(&mut data, at + 48, 1);
+            }
+        }
         data
     }
 
@@ -5369,6 +5527,8 @@ mod tests {
             assert!(rows.iter().any(|(_, text)| text.contains("ELF")));
             assert!(rows.iter().any(|(_, text)| text.contains("PT_LOAD")));
             assert!(rows.iter().any(|(_, text)| text.contains(".text")));
+            assert_eq!(structures(&data, 3).unwrap(), rows[..3]);
+            assert!(structures(&data, 0).unwrap().is_empty());
             let bss = rows.iter().find(|(_, text)| text.contains(".bss")).unwrap();
             let section_size = if bits == 32 {
                 ELF32_SECTION_SIZE
@@ -5432,6 +5592,117 @@ mod tests {
         low_sections.section_count = 0;
         low_sections.section_names = 0xffff;
         assert!(low_sections.resolve_counts(Some(&section_zero)).is_err());
+    }
+
+    /*
+    This test uses the maximum section count with a shared name that expands to four times its raw size.
+    A three-row limit retains two complete names without text allocation for the remaining sections.
+    The selected NOBITS row keeps section-header navigation.
+    */
+    #[test]
+    fn elf_structure_browser_bounds_shared_names_at_maximum_sections() {
+        let data = elf_shared_name_fixture(64, ELF_MAX_ENTRIES, &[0xff; MAX_NAME_BYTES]);
+        let rows = structures(&data, 3).unwrap();
+        assert_eq!(rows.len(), 3);
+        let retained_bytes: usize = rows.iter().map(|(_, text)| text.capacity()).sum();
+        assert!(retained_bytes <= 2 * MAX_NAME_BYTES * 4 + 512);
+        assert!(rows[1].1.starts_with(&format!(
+            "Section[1] {} SHT_STRTAB",
+            "\\xff".repeat(MAX_NAME_BYTES)
+        )));
+        assert_eq!(
+            rows[1].0,
+            ELF64_HEADER_SIZE + ELF_MAX_ENTRIES * ELF64_SECTION_SIZE
+        );
+        assert_eq!(rows[2].0, ELF64_HEADER_SIZE + 2 * ELF64_SECTION_SIZE);
+        assert!(rows[2].1.contains("SHT_NOBITS | File=-"));
+    }
+
+    /*
+    This test places an invalid name offset beyond the retained row limit in both ELF classes.
+    Even a zero-row request must reject the malformed final section name.
+    */
+    #[test]
+    fn elf_structure_browser_checks_names_beyond_row_limit() {
+        for bits in [32, 64] {
+            let mut data = elf_shared_name_fixture(bits, 4, b"x");
+            let (header_size, section_size) = if bits == 32 {
+                (ELF32_HEADER_SIZE, ELF32_SECTION_SIZE)
+            } else {
+                (ELF64_HEADER_SIZE, ELF64_SECTION_SIZE)
+            };
+            put(&mut data, header_size + 3 * section_size, 3);
+            for limit in [0, 1] {
+                assert_eq!(
+                    structures(&data, limit),
+                    Err("An ELF section-name offset is outside the string table.".into())
+                );
+            }
+        }
+    }
+
+    /*
+    This test preserves exact 4,096-byte names, empty names, and browser byte escaping in both ELF classes.
+    An excessive name remains invalid when the caller retains only the header row.
+    */
+    #[test]
+    fn elf_structure_browser_keeps_name_limits_and_escaping() {
+        for bits in [32, 64] {
+            let data = elf_shared_name_fixture(bits, 3, &[0xff; MAX_NAME_BYTES]);
+            let rows = structures(&data, usize::MAX).unwrap();
+            assert_eq!(rows.len(), 3);
+            assert!(rows[1].1.starts_with(&format!(
+                "Section[1] {} SHT_STRTAB",
+                "\\xff".repeat(MAX_NAME_BYTES)
+            )));
+
+            let empty = elf_shared_name_fixture(bits, 3, b"");
+            let rows = structures(&empty, usize::MAX).unwrap();
+            assert!(rows[1].1.starts_with("Section[1] <unnamed> SHT_STRTAB"));
+
+            let escaped = elf_shared_name_fixture(bits, 3, b"plain\\\"'\n\t\xff");
+            let rows = structures(&escaped, usize::MAX).unwrap();
+            assert!(
+                rows[1]
+                    .1
+                    .starts_with("Section[1] plain\\\\\\\"\\'\\n\\t\\xff SHT_STRTAB")
+            );
+
+            let excessive = elf_shared_name_fixture(bits, 3, &[0xff; MAX_NAME_BYTES + 1]);
+            assert_eq!(
+                structures(&excessive, 1),
+                Err("An ELF section name exceeds the limit of 4096 bytes.".into())
+            );
+        }
+    }
+
+    /*
+    This test rejects retained ELF row text above the aggregate limit with a clear error.
+    A smaller caller row limit still returns complete accepted rows.
+    The helper boundary check includes fixed row fields and escaped names before allocation.
+    */
+    #[test]
+    fn elf_structure_browser_rejects_aggregate_text_over_budget() {
+        let data = elf_shared_name_fixture(64, 1_024, &[0xff; MAX_NAME_BYTES]);
+        let rows = structures(&data, 1_000).unwrap();
+        assert_eq!(rows.len(), 1_000);
+        let retained_bytes: usize = rows.iter().map(|(_, text)| text.capacity()).sum();
+        assert!(retained_bytes <= ELF_MAX_STRUCTURE_TEXT_BYTES);
+        drop(rows);
+        let error = "The ELF structure text exceeds the limit of 16 MiB.";
+        assert_eq!(structures(&data, 10_001), Err(error.into()));
+
+        let mut rows = Vec::new();
+        let mut text_bytes = ELF_MAX_STRUCTURE_TEXT_BYTES - 6;
+        add_elf_row(&mut rows, &mut text_bytes, 0, "A", &[0xff], "B").unwrap();
+        assert_eq!(rows[0].1, "A\\xffB");
+        assert_eq!(text_bytes, ELF_MAX_STRUCTURE_TEXT_BYTES);
+        assert_eq!(
+            add_elf_row(&mut rows, &mut text_bytes, 0, "", b"x", ""),
+            Err(error.into())
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(text_bytes, ELF_MAX_STRUCTURE_TEXT_BYTES);
     }
 
     /*

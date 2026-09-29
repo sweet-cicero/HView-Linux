@@ -1113,16 +1113,31 @@ fn reopen_paged(path: &Path, device: u64, inode: u64) -> io::Result<PagedFile> {
 /// Advisory locks coordinate only with processes that use compatible locks.
 /// The replacement gets a new inode, change time, and birth time.
 /// The backup retains the original access and modification times.
+/// The caller supplies the descriptor that provided the accepted bytes.
+/// The result contains the backup path and the published descriptor.
 /// Cleanup errors can leave an incomplete recovery directory.
 /// A power loss after publication and before directory synchronization makes the publication result uncertain.
-pub fn replace(path: &Path, before: &[u8], after: &[u8]) -> io::Result<PathBuf> {
+pub fn replace(
+    path: &Path,
+    accepted: &File,
+    before: &[u8],
+    after: &[u8],
+) -> io::Result<(PathBuf, File)> {
     /*
     The first section opens, locks, validates, and captures one exact regular target.
+    The writable descriptor must match the descriptor that supplied the accepted bytes before any staging begins.
     A failure here creates no recovery directory and leaves the target unchanged.
     */
     let target = target(path)?;
     inspect_target(&target)?;
     let mut original = open_target(&target)?;
+    let accepted_metadata = accepted.metadata()?;
+    let original_metadata = original.metadata()?;
+    if (original_metadata.dev(), original_metadata.ino())
+        != (accepted_metadata.dev(), accepted_metadata.ino())
+    {
+        return Err(changed());
+    }
     original.try_lock().map_err(|error| match error {
         TryLockError::WouldBlock => {
             io::Error::other("The save target is in use. Close the other writer or use Save As.")
@@ -1136,33 +1151,39 @@ pub fn replace(path: &Path, before: &[u8], after: &[u8]) -> io::Result<PathBuf> 
 
     /*
     The second section prepares both byte images before the final target guard.
-    Publication retains the independent backup directory and returns its native path.
+    Publication returns the prepared descriptor with the independent backup path.
+    The caller adopts this descriptor without reopening an unchecked pathname.
     */
     let mut stage = Stage::new(&target)?;
     let _backup = prepare_backup(&stage, before, &source)?;
-    let _new_file = prepare_new(&stage, after, Some(&source))?;
+    let new_file = prepare_new(&stage, after, Some(&source))?;
     stage.sync_preparation()?;
     check_target(&target, &mut original, &source.state, before)?;
     stage.publish(&target, true)?;
-    Ok(stage
-        .folder_path
-        .join(std::ffi::OsStr::from_bytes(ORIGINAL_FILE.to_bytes())))
+    Ok((
+        stage
+            .folder_path
+            .join(std::ffi::OsStr::from_bytes(ORIGINAL_FILE.to_bytes())),
+        new_file,
+    ))
 }
 
 /// Create a file without replacing any existing destination entry.
+/// The result contains the resolved native destination and the published descriptor.
 /// Cleanup errors can leave an incomplete recovery directory.
 /// A power loss after publication and before directory synchronization makes the publication result uncertain.
-pub fn save_as(path: &Path, data: &[u8]) -> io::Result<PathBuf> {
+pub fn save_as(path: &Path, data: &[u8]) -> io::Result<(PathBuf, File)> {
     /*
     Save As stages one complete buffered image and publishes it with exclusive rename semantics.
-    A successful publication returns the resolved native destination path.
+    A successful publication returns the resolved native destination and the prepared descriptor.
+    The caller retains that descriptor as the next Save identity.
     */
     let target = target(path)?;
     let mut stage = Stage::new(&target)?;
-    let _new_file = prepare_new(&stage, data, None)?;
+    let new_file = prepare_new(&stage, data, None)?;
     stage.sync_preparation()?;
     stage.publish(&target, false)?;
-    Ok(target.path)
+    Ok((target.path, new_file))
 }
 
 /*
@@ -1963,7 +1984,7 @@ mod tests {
         The second section checks published bytes, backup bytes, identity, and every preserved metadata field.
         The backup timestamp check occurs before reading its contents can update access time.
         */
-        let backup = replace(&path, b"original", b"edited").unwrap();
+        let (backup, saved) = replace(&path, &file, b"original", b"edited").unwrap();
         let backup_file = File::open(&backup).unwrap();
         let backup_metadata = backup_file.metadata().unwrap();
         assert_eq!(
@@ -1976,8 +1997,11 @@ mod tests {
         );
         assert_eq!(fs::read(&path).unwrap(), b"edited");
         assert_eq!(fs::read(&backup).unwrap(), b"original");
-        let saved = File::open(&path).unwrap();
         assert_ne!(saved.metadata().unwrap().ino(), old_inode);
+        assert_eq!(
+            saved.metadata().unwrap().ino(),
+            fs::metadata(&path).unwrap().ino()
+        );
         assert_eq!(saved.metadata().unwrap().mode() & 0o7777, 0o640);
         assert_eq!(saved.metadata().unwrap().uid(), source.state.uid);
         assert_eq!(saved.metadata().unwrap().gid(), source.state.gid);
@@ -1998,6 +2022,150 @@ mod tests {
     }
 
     /*
+    This test redirects buffered paths to different files with identical accepted bytes.
+    Replacement must refuse each identity before staging or changing either file.
+    */
+    #[test]
+    fn buffered_replacement_rejects_matching_path_substitution_before_staging() {
+        for redirect_parent in [false, true] {
+            /*
+            Both regular files contain the same bytes while their descriptors identify different inodes.
+            The source selector supplies the accepted bytes and their original read descriptor.
+            */
+            let fixture = Fixture::new();
+            let first = fixture.0.join("first");
+            let second = fixture.0.join("second");
+            fs::create_dir(&first).unwrap();
+            fs::create_dir(&second).unwrap();
+            let original_path = first.join("sample.bin");
+            let other_path = second.join("sample.bin");
+            fs::write(&original_path, b"same").unwrap();
+            fs::write(&other_path, b"same").unwrap();
+            let parent = fixture.0.join("parent");
+            symlink(&first, &parent).unwrap();
+            let path = if redirect_parent {
+                parent.join("sample.bin")
+            } else {
+                original_path.clone()
+            };
+            let crate::paged::OpenedSource::Buffered { data, file, .. } =
+                crate::paged::open_source(&path).unwrap()
+            else {
+                panic!("The short source must use buffered storage.");
+            };
+            let original_inode = file.metadata().unwrap().ino();
+
+            /*
+            A parent-link change or pathname replacement redirects the writable target after the read.
+            The retained descriptor prevents the original inode from becoming available for reuse.
+            */
+            if redirect_parent {
+                fs::remove_file(&parent).unwrap();
+                symlink(&second, &parent).unwrap();
+            } else {
+                fs::rename(&original_path, first.join("moved.bin")).unwrap();
+                fs::write(&original_path, b"same").unwrap();
+            }
+            assert_ne!(fs::metadata(&path).unwrap().ino(), original_inode);
+            assert_eq!(fs::read(&path).unwrap(), data);
+            let error = replace(&path, &file, &data, b"edit").unwrap_err();
+            assert!(error.to_string().contains("changed outside the editor"));
+            assert_eq!(fs::read(&original_path).unwrap(), b"same");
+            assert_eq!(fs::read(&other_path).unwrap(), b"same");
+            assert_eq!(
+                fs::read_dir(&first).unwrap().count(),
+                if redirect_parent { 1 } else { 2 }
+            );
+            assert_eq!(fs::read_dir(&second).unwrap().count(), 1);
+            assert!(fixture.recovery_dirs().is_empty());
+        }
+    }
+
+    /*
+    This test uses each published buffered descriptor as the identity for the next replacement.
+    A retained descriptor from an earlier Save must fail even when the accepted bytes match.
+    */
+    #[test]
+    fn buffered_replacement_renews_identity_for_repeated_saves() {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("repeat.bin");
+        fs::write(&path, b"first").unwrap();
+        let crate::paged::OpenedSource::Buffered { data, file, .. } =
+            crate::paged::open_source(&path).unwrap()
+        else {
+            panic!("The short source must use buffered storage.");
+        };
+        let (first_backup, first) = replace(&path, &file, &data, b"second").unwrap();
+        assert_eq!(fs::read(first_backup).unwrap(), b"first");
+        assert_eq!(
+            first.metadata().unwrap().ino(),
+            fs::metadata(&path).unwrap().ino()
+        );
+        assert!(replace(&path, &file, b"second", b"stale").is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"second");
+
+        /*
+        The returned descriptor identifies the prepared inode after publication without a new path open.
+        A second Save must adopt another new descriptor and preserve its exact preceding backup.
+        */
+        let (second_backup, second) = replace(&path, &first, b"second", b"third").unwrap();
+        assert_eq!(fs::read(second_backup).unwrap(), b"second");
+        assert_eq!(fs::read(&path).unwrap(), b"third");
+        assert_ne!(
+            first.metadata().unwrap().ino(),
+            second.metadata().unwrap().ino()
+        );
+        assert_eq!(
+            second.metadata().unwrap().ino(),
+            fs::metadata(&path).unwrap().ino()
+        );
+        assert_eq!(fixture.recovery_dirs().len(), 2);
+    }
+
+    /*
+    This test retains the resolved Save As path and its prepared descriptor.
+    A later parent-link change cannot redirect replacement Save to another matching file.
+    */
+    #[test]
+    fn buffered_save_as_retains_resolved_path_and_supports_replacement() {
+        let fixture = Fixture::new();
+        let first = fixture.0.join("first");
+        let second = fixture.0.join("second");
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        let parent = fixture.0.join("parent");
+        symlink(&first, &parent).unwrap();
+        let (path, file) = save_as(&parent.join("copy.bin"), b"saved").unwrap();
+        assert_eq!(path, first.join("copy.bin"));
+        assert_eq!(
+            file.metadata().unwrap().ino(),
+            fs::metadata(&path).unwrap().ino()
+        );
+        assert!(fs::read_dir(&first).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .as_bytes()
+                .starts_with(b".HView-save-")
+        }));
+
+        /*
+        Save As returns the canonical parent path used for descriptor-relative publication.
+        Replacement uses that path and the returned descriptor after the original parent link changes.
+        */
+        fs::write(second.join("copy.bin"), b"saved").unwrap();
+        fs::remove_file(&parent).unwrap();
+        symlink(&second, &parent).unwrap();
+        let (_, published) = replace(&path, &file, b"saved", b"edited").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"edited");
+        assert_eq!(fs::read(parent.join("copy.bin")).unwrap(), b"saved");
+        assert_eq!(
+            published.metadata().unwrap().ino(),
+            fs::metadata(&path).unwrap().ino()
+        );
+    }
+
+    /*
     This test rejects changed bytes, nonregular paths, links, locks, and pathname substitution.
     Each condition stops before buffered replacement publication.
     */
@@ -2010,9 +2178,9 @@ mod tests {
         let fixture = Fixture::new();
         let path = fixture.0.join("sample.bin");
         fs::write(&path, b"changed").unwrap();
-        assert!(replace(&path, b"original", b"edit").is_err());
+        assert!(replace(&path, &File::open(&path).unwrap(), b"original", b"edit").is_err());
         assert!(
-            replace(&fixture.0, b"", b"edit")
+            replace(&fixture.0, &File::open(&fixture.0).unwrap(), b"", b"edit")
                 .unwrap_err()
                 .to_string()
                 .contains("regular file")
@@ -2025,7 +2193,7 @@ mod tests {
         let link = fixture.0.join("link.bin");
         symlink(&path, &link).unwrap();
         assert!(
-            replace(&link, b"changed", b"edit")
+            replace(&link, &File::open(&link).unwrap(), b"changed", b"edit")
                 .unwrap_err()
                 .to_string()
                 .contains("symbolic link")
@@ -2034,7 +2202,7 @@ mod tests {
         let hard = fixture.0.join("hard.bin");
         fs::hard_link(&path, &hard).unwrap();
         assert!(
-            replace(&path, b"changed", b"edit")
+            replace(&path, &File::open(&path).unwrap(), b"changed", b"edit")
                 .unwrap_err()
                 .to_string()
                 .contains("hard links")
@@ -2048,7 +2216,7 @@ mod tests {
         let lock = File::open(&path).unwrap();
         lock.try_lock().unwrap();
         assert!(
-            replace(&path, b"changed", b"edit")
+            replace(&path, &File::open(&path).unwrap(), b"changed", b"edit")
                 .unwrap_err()
                 .to_string()
                 .contains("in use")
@@ -2079,7 +2247,13 @@ mod tests {
         let read_only = fixture.0.join("read-only.bin");
         fs::write(&read_only, b"original").unwrap();
         fs::set_permissions(&read_only, fs::Permissions::from_mode(0o444)).unwrap();
-        let error = replace(&read_only, b"original", b"edited").unwrap_err();
+        let error = replace(
+            &read_only,
+            &File::open(&read_only).unwrap(),
+            b"original",
+            b"edited",
+        )
+        .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert!(error.to_string().contains("Save As"));
         assert_eq!(fs::read(&read_only).unwrap(), b"original");
@@ -2093,7 +2267,8 @@ mod tests {
             fs::write(&path, b"original").unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
             assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, mode);
-            let error = replace(&path, b"original", b"edited").unwrap_err();
+            let error =
+                replace(&path, &File::open(&path).unwrap(), b"original", b"edited").unwrap_err();
             assert!(error.to_string().contains("set-user-ID or set-group-ID"));
             assert_eq!(fs::read(&path).unwrap(), b"original");
         }
@@ -2138,7 +2313,7 @@ mod tests {
         */
         let fixture = Fixture::new();
         let path = fixture.0.join("new.bin");
-        assert_eq!(save_as(&path, b"new").unwrap(), path);
+        assert_eq!(save_as(&path, b"new").unwrap().0, path);
         assert_eq!(fs::read(&path).unwrap(), b"new");
         assert_eq!(
             save_as(&path, b"overwrite").unwrap_err().kind(),
@@ -2246,8 +2421,9 @@ mod tests {
         */
         let replace_path = fixture.0.join("replace.bin");
         fs::write(&replace_path, b"original").unwrap();
+        let accepted = File::open(&replace_path).unwrap();
         set_fault(FAULT_PUBLISH);
-        let error = replace(&replace_path, b"original", b"edited").unwrap_err();
+        let error = replace(&replace_path, &accepted, b"original", b"edited").unwrap_err();
         assert!(error.to_string().contains("Recovery files remain"));
         assert_eq!(fs::read(&replace_path).unwrap(), b"original");
         let recovery = fixture.recovery_dirs();
@@ -2264,7 +2440,7 @@ mod tests {
         Retained recovery data explains both byte states.
         */
         set_fault(FAULT_FINAL_SYNC);
-        let error = replace(&replace_path, b"original", b"edited").unwrap_err();
+        let error = replace(&replace_path, &accepted, b"original", b"edited").unwrap_err();
         assert!(error.to_string().contains("may already be visible"));
         assert_eq!(fs::read(&replace_path).unwrap(), b"edited");
         let recovery = fixture.recovery_dirs();
@@ -2273,6 +2449,14 @@ mod tests {
             fs::read(recovery[0].join("original.bin")).unwrap(),
             b"original"
         );
+
+        /*
+        Final synchronization failure returns no replacement descriptor to adopt.
+        A retry with the retained original descriptor must refuse the published inode before staging.
+        */
+        assert!(replace(&replace_path, &accepted, b"edited", b"retry").is_err());
+        assert_eq!(fs::read(&replace_path).unwrap(), b"edited");
+        assert_eq!(fixture.recovery_dirs().len(), 1);
     }
 
     /*
@@ -2830,7 +3014,8 @@ mod tests {
             acl.iter()
                 .any(|(name, _)| name == b"system.posix_acl_access")
         );
-        let backup = replace(&path, b"original", b"edited").unwrap();
+        let (backup, _) =
+            replace(&path, &File::open(&path).unwrap(), b"original", b"edited").unwrap();
         assert_eq!(xattrs(&File::open(&path).unwrap()).unwrap(), acl);
         assert_eq!(xattrs(&File::open(backup).unwrap()).unwrap(), acl);
 
@@ -2864,7 +3049,13 @@ mod tests {
         */
         let plain_attrs = xattrs(&File::open(&plain_path).unwrap()).unwrap();
         assert!(plain_attrs.is_empty());
-        let plain_backup = replace(&plain_path, b"plain", b"edited").unwrap();
+        let (plain_backup, _) = replace(
+            &plain_path,
+            &File::open(&plain_path).unwrap(),
+            b"plain",
+            b"edited",
+        )
+        .unwrap();
         assert!(
             xattrs(&File::open(&plain_path).unwrap())
                 .unwrap()
@@ -2924,7 +3115,7 @@ mod tests {
         let path = fixture.0.join("large.bin");
         let data = vec![0xa5; 131_073];
         fs::write(&path, &data).unwrap();
-        let backup = replace(&path, &data, b"").unwrap();
+        let (backup, _) = replace(&path, &File::open(&path).unwrap(), &data, b"").unwrap();
         assert!(fs::read(&path).unwrap().is_empty());
         assert_eq!(fs::read(backup).unwrap(), data);
 
@@ -2933,7 +3124,7 @@ mod tests {
         The exact native PathBuf and bytes survive publication.
         */
         let unicode = fixture.0.join("données.bin");
-        assert_eq!(save_as(&unicode, b"new").unwrap(), unicode);
+        assert_eq!(save_as(&unicode, b"new").unwrap().0, unicode);
         assert_eq!(fs::read(unicode).unwrap(), b"new");
     }
 }

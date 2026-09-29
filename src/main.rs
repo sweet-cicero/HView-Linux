@@ -40,8 +40,8 @@ Native path values remain separate from text used for terminal display.
 use console::Console;
 use editor::{Editor, Key, Mode};
 use std::collections::VecDeque;
-use std::fs::{self, OpenOptions};
-use std::io;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
@@ -2233,7 +2233,7 @@ It returns the current native path and Editor state after quit or file selection
 fn open_editor(
     console: &Console,
     mut path: PathBuf,
-    data: Vec<u8>,
+    source: (Vec<u8>, File),
     options: &cli::Options,
     config: &config::Config,
     saved_view: Option<&RuntimeView>,
@@ -2241,8 +2241,10 @@ fn open_editor(
 ) -> io::Result<(EditorAction, Option<(PathBuf, Editor)>)> {
     /*
     The lifecycle supplies bytes from the descriptor that selected buffered storage.
+    The view retains that descriptor as the accepted identity for replacement Save.
     This view preserves all established small-file behavior after that bounded open.
     */
+    let (data, mut file) = source;
     /*
     Startup mode and offset use CLI choices before format conversion and configuration defaults.
     Invalid format offsets produce a notice and select file offset zero.
@@ -2353,13 +2355,12 @@ fn open_editor(
         if ctrl && key.code == 83 {
             if let Some(name) = console.prompt(&lines, "Save As (new file)")? {
                 let destination = PathBuf::from(name.trim().trim_matches('"'));
-                let result = std::path::absolute(&destination).and_then(|destination| {
-                    save::save_as(&destination, &view.data)?;
-                    Ok(destination)
-                });
+                let result = std::path::absolute(&destination)
+                    .and_then(|destination| save::save_as(&destination, &view.data));
                 match result {
-                    Ok(destination) => {
+                    Ok((destination, published)) => {
                         path = destination;
+                        file = published;
                         saved.clone_from(&view.data);
                         view.source_changed();
                         view.saved();
@@ -2661,10 +2662,12 @@ fn open_editor(
             Alt+S publishes buffered edits through the guarded replacement path.
             Legacy macro F9 records keep the same save action.
             A successful save resets the saved comparison bytes and dirty state.
+            The prepared descriptor becomes the accepted identity for the next Save.
             */
             code if view.editing && (key.is_alt(b'S') || code == 120) => {
-                match save::replace(&path, &saved, &view.data) {
-                    Ok(_) => {
+                match save::replace(&path, &file, &saved, &view.data) {
+                    Ok((_, published)) => {
+                        file = published;
                         saved.clone_from(&view.data);
                         view.saved();
                         updated = true;
@@ -2946,23 +2949,30 @@ fn run() -> io::Result<()> {
     /*
     Session input remains separate from the permission to publish changed session bytes.
     A later path representation failure can disable publication without losing loaded state.
+    The session reader retains the exact descriptor that supplies its accepted bytes.
     */
     let session_requested = config.savefile_at_exit || options.save_file.is_some();
-    let saved_bytes = if session_requested {
-        match fs::read(&save_path) {
-            Ok(bytes) => Some(bytes),
+    let saved_source = if session_requested {
+        match File::open(&save_path).and_then(|mut file| {
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            Ok((bytes, file))
+        }) {
+            Ok(source) => Some(source),
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(error) => return Err(error),
         }
     } else {
         None
     };
-    let mut saved_state =
-        if options.file_masks.is_empty() && session_requested && saved_bytes.is_some() {
-            Some(config::parse_saved(saved_bytes.as_deref().unwrap()).map_err(io::Error::other)?)
-        } else {
-            None
-        };
+    let mut saved_state = if options.file_masks.is_empty()
+        && session_requested
+        && let Some((bytes, _)) = &saved_source
+    {
+        Some(config::parse_saved(bytes).map_err(io::Error::other)?)
+    } else {
+        None
+    };
 
     /*
     Macro parsing and path selection occur before any source opens.
@@ -3067,11 +3077,11 @@ fn run() -> io::Result<()> {
         };
         let saved_view = runtime_views.get(index).and_then(Option::as_ref);
         let (action, closed) = match source {
-            paged::OpenedSource::Buffered(data) => {
+            paged::OpenedSource::Buffered { data, file, .. } => {
                 let (action, view) = open_editor(
                     &console,
                     paths[index].clone(),
-                    data,
+                    (data, file),
                     &options,
                     &config,
                     saved_view,
@@ -3199,11 +3209,12 @@ fn run() -> io::Result<()> {
     /*
     Publish SAV bytes only when all current paths have a supported representation.
     Disabled publication leaves the original bytes unchanged on disk.
+    Replacement requires the retained session descriptor before staging any updated bytes.
     */
     if session_publish && let Some(state) = saved_state {
         let bytes = config::encode_saved(&state.payload).map_err(io::Error::other)?;
-        if let Some(before) = saved_bytes {
-            save::replace(&save_path, &before, &bytes)?;
+        if let Some((before, file)) = saved_source {
+            save::replace(&save_path, &file, &before, &bytes)?;
         } else {
             save::save_as(&save_path, &bytes)?;
         }
@@ -3514,7 +3525,7 @@ mod tests {
         file.sync_all().unwrap();
         let source = match paged::open_source(&path).unwrap() {
             paged::OpenedSource::Paged(source) => source,
-            paged::OpenedSource::Buffered(_) => panic!("The sparse source must be paged."),
+            paged::OpenedSource::Buffered { .. } => panic!("The sparse source must be paged."),
         };
         let rows = paged_hex_rows(&source, 0, 4097, '-').unwrap();
         assert_eq!(rows.len(), 4097);

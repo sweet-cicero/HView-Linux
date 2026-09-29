@@ -8,7 +8,7 @@ use crate::{
     editor::{ByteOrder, Editor, Mode, RawModel},
     format, inspect, operations,
 };
-use std::{cell::Cell, fs, io};
+use std::{cell::Cell, io, path::Path};
 
 /*
 This worker wrapper keeps terminal access on the caller thread and lends stable Editor bytes to one scoped worker.
@@ -615,29 +615,29 @@ pub fn tools(console: &Console, view: &mut Editor, base: &[String]) -> io::Resul
             .map(|items| ("Entropy | bits/byte, not a packer verdict", items))
         }
         /*
-        The comparison tool reads one selected file and reports changed ranges from buffer to file.
-        It keeps current unsaved bytes as the left comparison input.
+        The comparison worker opens one regular peer and reads bounded windows.
+        Current unsaved bytes remain the left input while the caller accepts cancellation and terminal input.
+        Only complete, validated rows enter the existing result browser.
         */
         'D' => {
             let Some(path) = console.prompt(base, "Compare file")? else {
                 return Ok(false);
             };
-            match fs::read(path.trim().trim_matches('"')) {
-                Ok(other) => {
-                    let mut items = operations::differences(&view.data, &other, 10001);
-                    let title = if items.len() > 10000 {
-                        items.truncate(10000);
-                        "Compare | buffer -> file | truncated at 10000 ranges"
-                    } else {
-                        "Compare | buffer -> file"
-                    };
-                    Some((title, items))
-                }
-                Err(error) => {
-                    console.modal(base, &error.to_string())?;
-                    None
-                }
-            }
+            let path = Path::new(path.trim().trim_matches('"'));
+            run_analysis(console, view, base, "Compare", |reporter| {
+                operations::compare_file_cancellable(&view.data, path, 10001, |progress| {
+                    reporter.progress(progress)
+                })
+            })?
+            .map(|mut items| {
+                let title = if items.len() > 10000 {
+                    items.truncate(10000);
+                    "Compare | buffer -> file | truncated at 10000 ranges"
+                } else {
+                    "Compare | buffer -> file"
+                };
+                (title, items)
+            })
         }
         /*
         The integer tool reads bounded values at the cursor with the selected byte order.

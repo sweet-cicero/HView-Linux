@@ -4,6 +4,7 @@
 # These imports build bounded executable fixtures and disposable terminal sessions.
 # The shared terminal helper verifies process exit and terminal restoration.
 from pathlib import Path
+import os
 import struct
 import sys
 import tempfile
@@ -15,6 +16,8 @@ from terminal_probe import run_session
 # Each Alt sequence uses the raw Escape-prefixed form parsed by Console.
 CTRL_Q = b"\x11"
 CTRL_T = b"\x14"
+CTRL_Z = b"\x1a"
+CTRL_Y = b"\x19"
 DOWN = b"\x1b[B"
 ENTER = b"\r"
 ESC = b"\x1b"
@@ -25,6 +28,7 @@ ALT_R = b"\x1br"
 PAGE_DOWN = b"\x1b[6~"
 ALT_B = b"\x1bb"
 RIGHT = b"\x1b[C"
+LEFT = b"\x1b[D"
 
 
 # This assertion requires each decoded text item in captured terminal output.
@@ -253,12 +257,99 @@ def check_compare_and_cancel(binary: Path, root: Path) -> None:
     )
     require(
         output,
+        "Compare... Working",
         "1 byte: old [FF], new [00]",
         "1 byte: old [00], new [CC]",
         header(0x80),
     )
     if current.read_bytes() != original:
         raise AssertionError("Edit cancellation changed the comparison file.")
+
+
+# These checks reject a FIFO without a writer and accept two large sparse regular peers.
+# Undo, redo, and edit cancellation must preserve the current file after each worker result.
+def check_compare_sources(binary: Path, root: Path) -> None:
+    """Check guarded peer opening, sparse lengths, and current edit state."""
+    current = root / "guarded-current.bin"
+    original = bytes(0x100)
+    current.write_bytes(original)
+    fifo = root / "compare.fifo"
+    os.mkfifo(fifo, 0o600)
+
+    # The FIFO has no writer, so the regular-file guard must return before terminal input stops.
+    # A later empty comparison after undo proves that the failed worker kept the edit history.
+    output = run_session(
+        binary,
+        ["/Oh=0", str(current)],
+        [
+            ALT_E, b"FF", CTRL_T, b"d", fifo.name.encode(), ENTER, ENTER,
+            CTRL_Z, CTRL_T, b"d", current.name.encode(), ENTER, ESC,
+            CTRL_Y, CTRL_T, b"d", current.name.encode(), ENTER, ESC, ESC, CTRL_Q,
+        ],
+    )
+    require(output, "Compare... Working", "The source is not a regular file.", "No results.", "1 byte: old [FF], new [00]")
+    if current.read_bytes() != original:
+        raise AssertionError("FIFO comparison changed the current file.")
+
+    # Sparse tails exceed 64 MiB and 4 GiB while the child has only 96 MiB of address space.
+    # Exact length and eight preview bytes prove that comparison accepts the complete peer length.
+    for length in (128 * 1024 * 1024 + 17, (1 << 32) + 17):
+        peer = root / f"compare-{length}.bin"
+        with peer.open("wb") as file:
+            file.write(original)
+            file.write(b"abcdefgh")
+            file.truncate(length)
+        output = run_session(
+            binary,
+            ["/Oh=0", str(current)],
+            [
+                (128, 24), ALT_E, b"FF", CTRL_T, b"d", peer.name.encode(), ENTER, ESC,
+                CTRL_Z, CTRL_T, b"i", ESC, CTRL_Y, ESC, CTRL_Q,
+            ],
+            address_limit_bytes=96 * 1024 * 1024,
+        )
+        require(
+            output,
+            "Compare... Working",
+            "1 byte: old [FF], new [00]",
+            f"{length - len(original)} bytes: old [<absent>], new [61 62 63 64 65 66 67 68 ...]",
+            "8-bit: unsigned 0, signed 0, hex 00",
+        )
+        if current.read_bytes() != original or peer.stat().st_size != length:
+            raise AssertionError("Sparse comparison changed a source file.")
+
+
+# This check queues Escape with prompt completion while a large common range enters the worker.
+# Following physical keys verify cancellation, active bytes, undo, redo, and terminal restoration.
+def check_compare_worker_cancel(binary: Path, root: Path) -> None:
+    """Check Compare cancellation without a partial browser or changed edit state."""
+    current = root / "cancel-current.bin"
+    peer = root / "cancel-peer.bin"
+    length = 64 * 1024 * 1024
+    with current.open("wb") as file:
+        file.truncate(length)
+    with peer.open("wb") as file:
+        file.truncate(128 * 1024 * 1024 + 17)
+
+    # Separate actions leave the Escape continuation interval empty before the next menu key arrives.
+    # Left returns the cursor to the edited byte before comparison checks its preserved position.
+    # Current unsaved FF bytes must remain visible before undo restores the original zero byte.
+    output = run_session(
+        binary,
+        ["/Oh=0", str(current)],
+        [
+            ALT_E, b"FF", LEFT, CTRL_T, b"d", peer.name.encode(),
+            ENTER + ESC, CTRL_T + b"i", ESC, CTRL_Z, CTRL_T, b"i", ESC,
+            CTRL_Y, ESC, CTRL_Q,
+        ],
+        address_limit_bytes=384 * 1024 * 1024,
+    )
+    require(output, "Compare... Working", "00000000  8-bit: unsigned 255, signed -1, hex FF", "00000000  8-bit: unsigned 0, signed 0, hex 00")
+    if b"Compare | buffer -> file" in output:
+        raise AssertionError("Canceled comparison opened a partial result browser.")
+    with current.open("rb") as file:
+        if file.read(32) != bytes(32) or current.stat().st_size != length:
+            raise AssertionError("Compare cancellation changed the current file.")
 
 
 # This check applies Fill and XOR ranges through Editor history, then saves accepted bytes.
@@ -436,6 +527,16 @@ def main() -> None:
         check_inspection(binary, root)
         check_entropy(binary, root)
         check_compare_and_cancel(binary, root)
+
+        # Short prompt paths keep the key sequence behind completed prompt redraws.
+        # Restore the caller directory before later checks use their existing absolute paths.
+        previous = Path.cwd()
+        try:
+            os.chdir(root)
+            check_compare_sources(binary, root)
+            check_compare_worker_cancel(binary, root)
+        finally:
+            os.chdir(previous)
         check_ranges(binary, root)
 
         pe32 = root / "fixture-pe32.bin"

@@ -443,6 +443,39 @@ def check_structures(binary: Path, path: Path) -> None:
         raise AssertionError("ELF structure browsing changed the source file.")
 
 
+# This check creates shared section names that exceed the aggregate limit before the browser row limit.
+# The address-space limit requires bounded text allocation and a clear modal error.
+def check_structure_text_limit(binary: Path, root: Path) -> None:
+    """Check the ELF structure text limit through the terminal."""
+    count = 1_024
+    names = b"\0" + b"\xff" * 4_096 + b"\0"
+    names_file = ELF_SECTION_TABLE + count * 64
+    data = bytearray(names_file + len(names))
+    data[:64] = elf_fixture(64, 62, 1, b"")[:64]
+    put16(data, 60, count)
+    put16(data, 62, 1)
+    data[names_file:] = names
+
+    # The string-table section owns the shared name bytes.
+    # The remaining NOBITS sections use the same name without overlapping file data.
+    put_section(data, 64, 1, 1, 3, 0, 0, names_file, len(names), 1)
+    for index in range(2, count):
+        put_section(data, 64, index, 1, 8, 0, 0, 0, 1, 1)
+    path = root / "text-limit.elf"
+    path.write_bytes(data)
+    # Enter closes the parser error before Ctrl+Q quits the viewer.
+    output = run_session(
+        binary,
+        ["--mode=hex", str(path)],
+        [CTRL_T, b"p", ENTER, CTRL_Q],
+        address_limit_bytes=ADDRESS_LIMIT,
+    )
+    require(output, b"The ELF structure text exceeds the limit of 16 MiB.")
+    require(last_header(output, path.name), offset_header(0))
+    if path.read_bytes() != data:
+        raise AssertionError("The ELF structure text error changed the source file.")
+
+
 # This check edits the real entry field and reparses the current buffer for every browser opening.
 # Undo and Redo change the row before Alt+S saves the final header byte.
 def check_current_header_edit(binary: Path, root: Path) -> None:
@@ -618,6 +651,7 @@ def main() -> None:
         check_arm_families(binary, root)
         check_raw_override(binary, root)
         check_structures(binary, base)
+        check_structure_text_limit(binary, root)
         check_current_header_edit(binary, root)
         check_malformed_notices(binary, root)
         check_sparse_startup_and_switching(binary, root)

@@ -227,6 +227,9 @@ The ELF browser shows headers, entries, program records, and section records. Th
 
 HView-Linux does not apply runtime rebasing to ELF addresses. The ELF browser limits output to 10,000 rows.
 
+The ELF browser validates all section names and escapes names only for retained rows.
+If retained ELF row text exceeds 16 MiB, the browser returns an error.
+
 Code mode can also decode raw x86, ARM, Thumb, and ARM64 bytes.
 
 ### Raw address model
@@ -267,9 +270,10 @@ String results use a four-character minimum and a 120-character display limit. S
 
 The entropy tool uses blocks of at least 4,096 bytes. The tool increases the block size for large files.
 
-Entropy runs as bounded cancellable work and uses the current source stamp. Progress shows on the active editor frame.
+Entropy and Compare run as bounded cancellable work and use current source stamps. Progress shows on the active editor frame.
 
-The other analysis tools remain synchronous. Their input and result behavior stays unchanged.
+Press `Esc` to cancel Entropy or Compare. Canceled work returns no partial results.
+The other analysis tools remain synchronous.
 
 ## Editing and saving
 
@@ -319,7 +323,8 @@ A published replacement reopen failure closes the unusable view and prevents SAV
 
 A published Save As reopen failure retains the original source, edits, and histories. Edit cancellation clears both histories.
 
-An in-place save checks the original bytes, file identity, metadata, and an advisory file lock before publication.
+An in-place save checks read-time file identity, original bytes, metadata, and an advisory file lock before publication.
+Buffered Save and existing-session replacement refuse a different inode, even when its bytes match the original bytes.
 
 The replacement keeps the owner, group, permission mode, user xattrs, and POSIX access ACL. The replacement receives a new inode.
 
@@ -371,7 +376,9 @@ Large-file Text, Code display, format tools, structural edit controls, search, a
 
 Large-file PE and ELF startup can select a checked entry point or virtual address through bounded metadata reads.
 
-For buffered files, comparison also reads the other file into memory. Select file sizes that fit available memory with these copies.
+Compare accepts regular-file peers above 64 MiB through windows of at most 64 KiB.
+Peers through 64 MiB still use buffered storage.
+Compare rejects nonregular peers and preserves readable virtual regular-file contents.
 
 Text mode supports byte-oriented text. Text mode reports UTF-16 text and directs the user to Hex or Code mode.
 

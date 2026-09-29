@@ -14,12 +14,17 @@ import tempfile
 from terminal_probe import run_session
 
 
-# These key sequences select quit, file switching, and the file picker.
+# These key sequences select quit, editing, saving, file switching, and the file picker.
 # Tests send the exact terminal bytes used by the application.
 CTRL_Q = b"\x11"
+CTRL_S = b"\x13"
+CTRL_Y = b"\x19"
+CTRL_Z = b"\x1a"
+ALT_E = b"\x1be"
 ALT_N = b"\x1bn"
 ALT_O = b"\x1bo"
 ALT_P = b"\x1bp"
+ALT_S = b"\x1bs"
 DOWN = b"\x1b[B"
 
 
@@ -65,6 +70,14 @@ def require(output: bytes, text: bytes, reason: str) -> None:
     """Require terminal output text."""
     if text not in output:
         raise AssertionError(reason)
+
+
+# This helper redirects a disposable parent symbolic link after the application accepts its read.
+# The next Save must compare the writable target with the retained read descriptor.
+def redirect_parent(parent: Path, destination: Path) -> None:
+    """Redirect a parent symbolic link."""
+    parent.unlink()
+    parent.symlink_to(destination, target_is_directory=True)
 
 
 # This entry point runs each workflow in one disposable directory.
@@ -236,6 +249,100 @@ def main() -> None:
         run_session(binary, ["--session", str(session)], [CTRL_Q])
         if session.read_bytes()[32 + 100000] != 0x53:
             raise AssertionError("A session update changed an unknown payload byte.")
+
+        # This section redirects a buffered source to another file with identical accepted bytes.
+        # Failed Save must preserve Undo and Redo before two successful Saves renew the retained identity.
+        save_first = root / "save-first"
+        save_second = root / "save-second"
+        save_first.mkdir()
+        save_second.mkdir()
+        original = save_first / "sample.bin"
+        other = save_second / "sample.bin"
+        original.write_bytes(b"\x12")
+        other.write_bytes(b"\x12")
+        save_parent = root / "save-parent"
+        save_parent.symlink_to(save_first, target_is_directory=True)
+        output = run_session(
+            binary,
+            ["--mode=hex", "--offset=0", str(save_parent / "sample.bin")],
+            [
+                ALT_E,
+                b"a",
+                lambda: redirect_parent(save_parent, save_second),
+                ALT_S,
+                b"\r",
+                (81, 24, CTRL_Z, b"00000000:  12"),
+                (80, 24, CTRL_Y, b"00000000:  A2"),
+                lambda: redirect_parent(save_parent, save_first),
+                ALT_S,
+                ALT_E,
+                b"b",
+                ALT_S,
+                CTRL_Q,
+            ],
+        )
+        require(output, b"changed outside the editor", "Save accepted a different matching file.")
+        if original.read_bytes() != b"\xB2" or other.read_bytes() != b"\x12":
+            raise AssertionError("Buffered Save did not preserve and renew the accepted identity.")
+        backups = [path.read_bytes() for path in save_first.glob(".HView-save-*/original.bin")]
+        if sorted(backups) != [b"\x12", b"\xA2"]:
+            raise AssertionError("Repeated buffered Save did not preserve each preceding baseline.")
+        if any(save_second.glob(".HView-save-*")):
+            raise AssertionError("Refused buffered Save created a recovery directory.")
+
+        # This section saves edited bytes through a parent symbolic link.
+        # Save As must retain the resolved destination and its descriptor when the parent link later changes.
+        copy_source = root / "copy-source.bin"
+        copy_source.write_bytes(b"\x12")
+        copy_parent = root / "copy-parent"
+        copy_parent.symlink_to(save_first, target_is_directory=True)
+        copy_other = save_second / "copy.bin"
+        copy_other.write_bytes(b"\xA2")
+        run_session(
+            binary,
+            ["--mode=hex", "--offset=0", str(copy_source)],
+            [
+                ALT_E,
+                b"a",
+                CTRL_S,
+                str(copy_parent / "copy.bin").encode(),
+                # Require successful publication before the parent redirect changes the destination.
+                (80, 24, b"\r", "↓FUO --------".encode()),
+                lambda: redirect_parent(copy_parent, save_second),
+                ALT_E,
+                b"b",
+                ALT_S,
+                CTRL_Q,
+            ],
+        )
+        if (save_first / "copy.bin").read_bytes() != b"\xB2":
+            raise AssertionError("Save As did not retain its published destination and identity.")
+        if copy_source.read_bytes() != b"\x12" or copy_other.read_bytes() != b"\xA2":
+            raise AssertionError("Save after Save As changed another file.")
+
+        # This section redirects the session path after startup reads its accepted bytes.
+        # Session publication must refuse the different matching file before any recovery directory exists.
+        session_first = root / "session-first"
+        session_second = root / "session-second"
+        session_first.mkdir()
+        session_second.mkdir()
+        accepted_session = session.read_bytes()
+        (session_first / "state.sav").write_bytes(accepted_session)
+        (session_second / "state.sav").write_bytes(accepted_session)
+        session_parent = root / "session-parent"
+        session_parent.symlink_to(session_first, target_is_directory=True)
+        output = run_session(
+            binary,
+            ["--session", str(session_parent / "state.sav")],
+            [b"\x1b[C", lambda: redirect_parent(session_parent, session_second), CTRL_Q],
+            expected_code=1,
+        )
+        require(output, b"changed outside the editor", "Session publication accepted another matching file.")
+        for directory in (session_first, session_second):
+            if (directory / "state.sav").read_bytes() != accepted_session:
+                raise AssertionError("Refused session publication changed a session file.")
+            if any(directory.glob(".HView-save-*")):
+                raise AssertionError("Refused session publication created a recovery directory.")
 
         # This section checks Windows path rejection and native path persistence limits.
         # An unrepresentable session path must leave native viewing available.
